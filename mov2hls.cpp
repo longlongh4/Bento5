@@ -18,12 +18,33 @@
  * along with Bento5.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include <iostream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <cxxopts.hpp>
 
-using namespace std;
-
-int main()
+int main(int argc, char** argv)
 {
-    cout << "Hello World!" << endl;
+    cxxopts::Options options("mov2hls", "MOV/MP4 to HLS stream");
+
+    options.add_options()
+            ("i,input-files", "Input files, separated by , eg: 1.mp4,2.mp4,3.mp4", cxxopts::value<std::vector<std::string>>())
+            ("o,output-dir", "Output directory", cxxopts::value<std::string>())
+            ("hls-version", "HLS Version", cxxopts::value<std::string>()->default_value("3"))
+            ("master-playlist-name", "Master Playlist name", cxxopts::value<std::string>()->default_value("master.m3u8"))
+            ("output-single-file", "Store segment data in a sigle output file (default: false)", cxxopts::value<bool>()->default_value("false"))
+            ("v,verbose", "Be verbose (default: false)", cxxopts::value<bool>()->default_value("false"))
+            ("h,help", "Print usage")
+            ;
+
+    auto result = options.parse(argc, argv);
+
+    if (result.count("help") || result.count("input-files") == 0 || result.count("output-dir") == 0)
+    {
+        std::cout << options.help() << std::endl;
+        exit(0);
+    }
+
+    std::vector<std::string> file_paths = result["input-files"].as<std::vector<std::string>>();
+
     return 0;
 }

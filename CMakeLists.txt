@@ -43,6 +43,7 @@ include_directories(
   ${SOURCE_CODECS}
   ${SOURCE_CRYPTO}
   ${SOURCE_METADATA}
+  "lib/"
 )
 
 add_executable(mov2hls mov2hls.cpp)
