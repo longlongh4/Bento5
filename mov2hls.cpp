@@ -23,10 +23,43 @@
 #include <cxxopts.hpp>
 #include <filesystem>
 #include "Ap4.h"
+#include "Ap4Mp4AudioInfo.h"
 
 const uint PMT_PID = 0x100;
 const uint AUDIO_PID = 0x101;
 const uint VIDEO_PID = 0x102;
+
+const char* SEGMENT_FILENAME_TEMPLATE = "segment-%d.ts";
+const char* INDEX_FILENAME = "stream.m3u8";
+
+
+static struct _Stats {
+    AP4_UI64 segments_total_size;
+    double   segments_total_duration;
+    AP4_UI32 segment_count;
+    double   max_segment_bitrate;
+    AP4_UI64 iframes_total_size;
+    AP4_UI32 iframe_count;
+    double   max_iframe_bitrate;
+} Stats;
+
+/*----------------------------------------------------------------------
+|   OpenOutput
++---------------------------------------------------------------------*/
+static AP4_ByteStream*
+OpenOutput(std::filesystem::path out_folder, const char* filename_pattern, unsigned int segment_number)
+{
+    AP4_ByteStream* output = NULL;
+    char filename[4096];
+    sprintf(filename, filename_pattern, segment_number);
+    AP4_Result result = AP4_FileByteStream::Create(std::filesystem::absolute(out_folder.append(filename)).string().c_str(), AP4_FileByteStream::STREAM_MODE_WRITE, output);
+    if (AP4_FAILED(result)) {
+        fprintf(stderr, "ERROR: cannot open output (%d)\n", result);
+        return NULL;
+    }
+
+    return output;
+}
 
 /*----------------------------------------------------------------------
 |   SampleReader
@@ -86,6 +119,33 @@ AP4_Result
 FragmentedSampleReader::ReadSample(AP4_Sample& sample, AP4_DataBuffer& sample_data)
 {
     return m_FragmentReader.ReadNextSample(m_TrackId, sample, sample_data);
+}
+
+/*----------------------------------------------------------------------
+|   ReadSample
++---------------------------------------------------------------------*/
+static AP4_Result
+ReadSample(SampleReader&   reader,
+           AP4_Track&      track,
+           AP4_Sample&     sample,
+           AP4_DataBuffer& sample_data,
+           double&         ts,
+           double&         duration,
+           bool&           eos)
+{
+    AP4_Result result = reader.ReadSample(sample, sample_data);
+    if (AP4_FAILED(result)) {
+        if (result == AP4_ERROR_EOS) {
+            ts += duration;
+            eos = true;
+        } else {
+            return result;
+        }
+    }
+    ts = (double)sample.GetDts()/(double)track.GetMediaTimeScale();
+    duration = sample.GetDuration()/(double)track.GetMediaTimeScale();
+
+    return AP4_SUCCESS;
 }
 
 
@@ -253,6 +313,221 @@ public:
         delete ts_writer;
         delete input_stream;
     };
+
+    static AP4_Result write_samples(std::vector<OutputStream *>output_streams, double seg_duration) {
+        AP4_Sample              audio_sample;
+        AP4_DataBuffer          audio_sample_data;
+        unsigned int            audio_sample_count = 0;
+        double                  audio_ts = 0.0;
+        double                  audio_frame_duration = 0.0;
+        bool                    audio_eos = false;
+        AP4_Sample              video_sample;
+        AP4_DataBuffer          video_sample_data;
+        unsigned int            video_sample_count = 0;
+        double                  video_ts = 0.0;
+        double                  video_frame_duration = 0.0;
+        bool                    video_eos = false;
+        double                  last_ts = 0.0;
+        unsigned int            segment_number = 0;
+        AP4_ByteStream*         segment_output = NULL;
+        double                  segment_duration = 0.0;
+        AP4_Array<double>       segment_durations;
+        AP4_Array<AP4_UI32>     segment_sizes;
+        AP4_Position            segment_position = 0;
+        AP4_Array<AP4_Position> segment_positions;
+        bool                    new_segment = true;
+        AP4_ByteStream*         playlist = NULL;
+        char                    string_buffer[4096];
+        AP4_Result              result = AP4_SUCCESS;
+
+        const OutputStream *output = output_streams.at(0);
+        const InputStream *input = output->input_stream;
+
+        // prime the samples
+        if (input->audio_reader) {
+            result = ReadSample(*input->audio_reader, *input->audio_track, audio_sample, audio_sample_data, audio_ts, audio_frame_duration, audio_eos);
+            if (AP4_FAILED(result)) return result;
+        }
+        if (input->video_reader) {
+            result = ReadSample(*input->video_reader, *input->video_track, video_sample, video_sample_data, video_ts, video_frame_duration, video_eos);
+            if (AP4_FAILED(result)) return result;
+        }
+
+        for (;;) {
+            bool sync_sample = false;
+            AP4_Track* chosen_track= NULL;
+            if (input->audio_track && !audio_eos) {
+                chosen_track = input->audio_track;
+                if (input->video_track == NULL) sync_sample = true;
+            }
+            if (input->video_track && !video_eos) {
+                if (input->audio_track) {
+                    if (video_ts <= audio_ts) {
+                        chosen_track = input->video_track;
+                    }
+                } else {
+                    chosen_track = input->video_track;
+                }
+                if (chosen_track == input->video_track && video_sample.IsSync()) {
+                    sync_sample = true;
+                }
+            }
+
+            // check if we need to start a new segment
+            if (seg_duration && (sync_sample || chosen_track == NULL)) {
+                if (input->video_track) {
+                    segment_duration = video_ts - last_ts;
+                } else {
+                    segment_duration = audio_ts - last_ts;
+                }
+                if ((segment_duration >= seg_duration) || chosen_track == NULL) {
+                    if (input->video_track) {
+                        last_ts = video_ts;
+                    } else {
+                        last_ts = audio_ts;
+                    }
+                    if (segment_output) {
+                        // flush the output stream
+                        segment_output->Flush();
+
+                        // compute the segment size (including padding)
+                        AP4_Position segment_end = 0;
+                        segment_output->Tell(segment_end);
+                        AP4_UI32 segment_size = 0;
+                        if (segment_end > segment_position) {
+                            segment_size = (AP4_UI32)(segment_end-segment_position);
+                        }
+
+                        // update counters
+                        segment_sizes.Append(segment_size);
+                        segment_positions.Append(segment_position);
+                        segment_durations.Append(segment_duration);
+
+                        if (segment_duration != 0.0) {
+                            double segment_bitrate = 8.0*(double)segment_size/segment_duration;
+                            if (segment_bitrate > Stats.max_segment_bitrate) {
+                                Stats.max_segment_bitrate = segment_bitrate;
+                            }
+                        }
+                        segment_output->Release();
+                        segment_output = NULL;
+
+                        ++segment_number;
+                        audio_sample_count = 0;
+                        video_sample_count = 0;
+                    }
+                    new_segment = true;
+                }
+            }
+
+            // check if we're done
+            if (chosen_track == NULL) break;
+
+            if (new_segment) {
+                new_segment = false;
+
+                // compute the new segment position
+                segment_position = 0;
+
+                // manage the new segment stream
+                if (segment_output == NULL) {
+                    segment_output = OpenOutput(output->out_folder, SEGMENT_FILENAME_TEMPLATE, segment_number);
+                    if (segment_output == NULL) return AP4_ERROR_CANNOT_OPEN_FILE;
+                }
+
+                // write the PAT and PMT
+                if (output->ts_writer) {
+                    output->ts_writer->WritePAT(*segment_output);
+                    output->ts_writer->WritePMT(*segment_output);
+                }
+            }
+
+            // write the samples out and advance to the next sample
+            if (chosen_track == input->audio_track) {
+
+                // write the sample data
+                if (output->audio_stream) {
+                    result = output->audio_stream->WriteSample(audio_sample,
+                                                               audio_sample_data,
+                                                               input->audio_track->GetSampleDescription(audio_sample.GetDescriptionIndex()),
+                                                               input->video_track==NULL,
+                                                               *segment_output);
+                } else {
+                    return AP4_ERROR_INTERNAL;
+                }
+                if (AP4_FAILED(result)) return result;
+
+                result = ReadSample(*input->audio_reader, *input->audio_track, audio_sample, audio_sample_data, audio_ts, audio_frame_duration, audio_eos);
+                if (AP4_FAILED(result)) return result;
+                ++audio_sample_count;
+            } else if (chosen_track == input->video_track) {
+                // write the sample data
+                AP4_Position frame_start = 0;
+                segment_output->Tell(frame_start);
+                result = output->video_stream->WriteSample(video_sample,
+                                                           video_sample_data,
+                                                           input->video_track->GetSampleDescription(video_sample.GetDescriptionIndex()),
+                                                           true,
+                                                           *segment_output);
+                if (AP4_FAILED(result)) return result;
+                AP4_Position frame_end = 0;
+                segment_output->Tell(frame_end);
+
+                // read the next sample
+                result = ReadSample(*input->video_reader, *input->video_track, video_sample, video_sample_data, video_ts, video_frame_duration, video_eos);
+                if (AP4_FAILED(result)) return result;
+                ++video_sample_count;
+            } else {
+                break;
+            }
+        }
+
+        // create the media playlist/index file
+        playlist = OpenOutput(output->out_folder, INDEX_FILENAME, 0);
+        if (playlist == NULL) return AP4_ERROR_CANNOT_OPEN_FILE;
+
+        unsigned int target_duration = 0;
+        double       total_duration = 0.0;
+        for (unsigned int i=0; i<segment_durations.ItemCount(); i++) {
+            if ((unsigned int)(segment_durations[i]+0.5) > target_duration) {
+                target_duration = (unsigned int)segment_durations[i];
+            }
+            total_duration += segment_durations[i];
+        }
+
+        playlist->WriteString("#EXTM3U\r\n");
+        sprintf(string_buffer, "#EXT-X-VERSION:%d\r\n", 3);
+        playlist->WriteString(string_buffer);
+        playlist->WriteString("#EXT-X-PLAYLIST-TYPE:VOD\r\n");
+        if (input->video_track) {
+            playlist->WriteString("#EXT-X-INDEPENDENT-SEGMENTS\r\n");
+        }
+        playlist->WriteString("#EXT-X-TARGETDURATION:");
+        sprintf(string_buffer, "%d\r\n", target_duration);
+        playlist->WriteString(string_buffer);
+        playlist->WriteString("#EXT-X-MEDIA-SEQUENCE:0\r\n");
+
+        for (unsigned int i=0; i<segment_durations.ItemCount(); i++) {
+            sprintf(string_buffer, "#EXTINF:%f,\r\n", segment_durations[i]);
+            playlist->WriteString(string_buffer);
+            sprintf(string_buffer, SEGMENT_FILENAME_TEMPLATE, i);
+            playlist->WriteString(string_buffer);
+            playlist->WriteString("\r\n");
+        }
+
+        playlist->WriteString("#EXT-X-ENDLIST\r\n");
+        playlist->Release();
+
+        // update stats
+        Stats.segment_count = segment_sizes.ItemCount();
+        for (unsigned int i=0; i<segment_sizes.ItemCount(); i++) {
+            Stats.segments_total_size     += segment_sizes[i];
+            Stats.segments_total_duration += segment_durations[i];
+        }
+
+        if (segment_output) segment_output->Release();
+        return result;
+    }
 private:
 
     AP4_Mpeg2TsWriter*               ts_writer;
@@ -269,6 +544,7 @@ int main(int argc, char** argv)
     options.add_options()
             ("i,input-files", "Input files, separated by , eg: 1.mp4,2.mp4,3.mp4", cxxopts::value<std::vector<std::string>>())
             ("o,output-dir", "Output directory", cxxopts::value<std::string>())
+            ("segment-duration", "Segment duration", cxxopts::value<double>()->default_value("6"))
             ("master-playlist", "Master Playlist name", cxxopts::value<std::string>()->default_value("master.m3u8"))
             ("v,verbose", "Be verbose (default: false)", cxxopts::value<bool>()->default_value("false"))
             ("h,help", "Print usage")
@@ -282,6 +558,8 @@ int main(int argc, char** argv)
         exit(0);
     }
 
+    AP4_SetMemory(&Stats, 0, sizeof(Stats));
+
     std::vector<std::string> file_paths = result["input-files"].as<std::vector<std::string>>();
     std::vector<InputStream*> input_streams;
     std::transform(file_paths.begin(), file_paths.end(), std::back_inserter(input_streams), [](std::string s) {return new InputStream(s);});
@@ -293,6 +571,8 @@ int main(int argc, char** argv)
         std::filesystem::path file_path(result["output-dir"].as<std::string>());
         output_streams.push_back(new OutputStream(file_path.append(out_folder.str()), input_streams.at(i)));
     }
+
+    OutputStream::write_samples(output_streams, result["segment-duration"].as<double>());
 
     // clean up
     std::for_each(output_streams.begin(), output_streams.end(), [](OutputStream *ptr) {delete ptr;});
