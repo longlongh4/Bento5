@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <cxxopts.hpp>
+#include <filesystem>
 #include "Ap4.h"
 
 const uint PMT_PID = 0x100;
@@ -161,7 +162,11 @@ private:
 
 class OutputStream {
 public:
-    OutputStream(std::string folder, const InputStream* input): ts_writer(NULL), audio_stream(NULL), video_stream(NULL), input_stream(input) {
+    OutputStream(std::filesystem::path out_folder, const InputStream* input): ts_writer(NULL), audio_stream(NULL), video_stream(NULL), input_stream(input), out_folder(out_folder) {
+        if (bool flag = std::filesystem::create_directories(out_folder); flag == false) {
+            fprintf(stderr, "failed to create output folder at %s, maybe it already exists?\n", std::filesystem::absolute(out_folder).string().c_str());
+            exit(-1);
+        }
         // create an MPEG2 TS Writer
         ts_writer = new AP4_Mpeg2TsWriter(PMT_PID);
         // add the audio stream
@@ -246,12 +251,15 @@ public:
     };
     ~OutputStream() {
         delete ts_writer;
+        delete input_stream;
     };
 private:
+
     AP4_Mpeg2TsWriter*               ts_writer;
     AP4_Mpeg2TsWriter::SampleStream* audio_stream;
     AP4_Mpeg2TsWriter::SampleStream* video_stream;
     const InputStream *input_stream;
+    std::filesystem::path out_folder;
 };
 
 int main(int argc, char** argv)
@@ -278,7 +286,15 @@ int main(int argc, char** argv)
     std::vector<InputStream*> input_streams;
     std::transform(file_paths.begin(), file_paths.end(), std::back_inserter(input_streams), [](std::string s) {return new InputStream(s);});
 
+    std::vector<OutputStream*> output_streams;
+    for (unsigned int i = 0; i < input_streams.size(); i++) {
+        std::ostringstream out_folder;
+        out_folder << "output/media-" << i;
+        std::filesystem::path file_path(result["output-dir"].as<std::string>());
+        output_streams.push_back(new OutputStream(file_path.append(out_folder.str()), input_streams.at(i)));
+    }
+
     // clean up
-    std::for_each(input_streams.begin(), input_streams.end(), [](InputStream *ptr) {delete ptr;});
+    std::for_each(output_streams.begin(), output_streams.end(), [](OutputStream *ptr) {delete ptr;});
     return 0;
 }
