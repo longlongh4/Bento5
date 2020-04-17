@@ -32,6 +32,7 @@ const uint VIDEO_PID = 0x102;
 const char* SEGMENT_FILENAME_TEMPLATE = "segment-%d.ts";
 const char* INDEX_FILENAME = "stream.m3u8";
 
+const float MAX_DTS_DELTA = 0.2;
 
 static struct _Stats {
     AP4_UI64 segments_total_size;
@@ -207,6 +208,25 @@ public:
         delete audio_reader;
         delete linear_reader;
     };
+
+    std::vector<float> getKeyframesDTSTimeList() {
+        std::vector<float> array;
+        AP4_Track* video_track = movie->GetTrack(AP4_Track::TYPE_VIDEO);
+        if (video_track) {
+            AP4_Sample sample;
+            for(unsigned int i = 0; i < video_track->GetSampleCount(); i++) {
+                AP4_Result result = video_track->GetSample(i, sample);
+                if (AP4_FAILED(result)) {
+                    fprintf(stderr, "failed to get video sample in %s", file_path.c_str());
+                    exit(-1);
+                }
+                if (sample.IsSync()) {
+                    array.push_back(float(sample.GetDts()) / video_track->GetMediaTimeScale());
+                }
+            }
+        }
+        return array;
+    }
 private:
     std::string file_path;
     AP4_ByteStream* input;
@@ -314,7 +334,7 @@ public:
         delete input_stream;
     };
 
-    static AP4_Result write_samples(OutputStream *output, double seg_duration) {
+    static AP4_Result write_samples(OutputStream *output, float seg_duration, std::vector<float> segmentPoints) {
         AP4_Sample              audio_sample;
         AP4_DataBuffer          audio_sample_data;
         unsigned int            audio_sample_count = 0;
@@ -379,7 +399,9 @@ public:
                 } else {
                     segment_duration = audio_ts - last_ts;
                 }
-                if ((segment_duration >= seg_duration) || chosen_track == NULL) {
+                if ( (input->video_track == NULL && segment_duration >= seg_duration)
+                     || (input->video_track != NULL && std::find_if(segmentPoints.begin(), segmentPoints.end(), [video_ts](float x) {return abs(x - video_ts) <= 2 * MAX_DTS_DELTA; }) != segmentPoints.end())
+                     || chosen_track == NULL) {
                     if (input->video_track) {
                         last_ts = video_ts;
                     } else {
@@ -536,6 +558,65 @@ private:
     std::filesystem::path out_folder;
 };
 
+class VectorCommonFloatFinder {
+public:
+    VectorCommonFloatFinder(std::vector<float> vec) : vec(vec), index(0) {}
+    bool exist(float value) {
+        while(index < vec.size()) {
+            if (abs(vec.at(index) - value) < MAX_DTS_DELTA) {
+                return true;
+            }
+            if(vec.at(index) > value) {
+                break;
+            }
+            index++;
+        }
+        return false;
+    }
+private:
+    std::vector<float> vec;
+    unsigned int index;
+};
+
+std::vector<float> findAlignedDTS(std::vector<std::vector<float>> array) {
+    if (array.size() == 0) {
+        return std::vector<float>();
+    } else if (array.size() == 1) {
+        return array.at(0);
+    } else {
+        std::vector<float> res;
+        std::vector<float> front = array.front();
+        std::vector<VectorCommonFloatFinder*> finderArray;
+        std::transform(array.begin(), array.end(), std::back_inserter(finderArray), [](std::vector<float> x) {return new VectorCommonFloatFinder(x);});
+        for (unsigned int i = 0; i < front.size(); i++) {
+            bool not_exist = false;
+            for(unsigned int j = 0; j < finderArray.size(); j++) {
+                if(finderArray.at(j)->exist(front.at(i))==false) {
+                    not_exist = true;
+                    break;
+                }
+            }
+            if(not_exist == false) {
+                res.push_back(front.at(i));
+            }
+        }
+        std::for_each(finderArray.begin(), finderArray.end(), [](VectorCommonFloatFinder *ptr) {delete ptr;});
+        return res;
+    }
+}
+
+std::vector<float> filterDTSBySegmentDuration(std::vector<float> array, float segment_duration) {
+    float lastDTS = 0;
+    std::vector<float> res;
+    for (unsigned int i = 0; i < array.size(); i++) {
+        if ((array.at(i)-lastDTS) >= segment_duration || abs(array.at(i)-lastDTS-segment_duration) < 1) {
+            res.push_back(array.at(i));
+            lastDTS = array.at(i);
+        }
+    }
+    return res;
+}
+
 int main(int argc, char** argv)
 {
     cxxopts::Options options("mov2hls", "MOV/MP4 to HLS v3 stream");
@@ -571,7 +652,14 @@ int main(int argc, char** argv)
         output_streams.push_back(new OutputStream(file_path.append(out_folder.str()), input_streams.at(i)));
     }
 
-    std::for_each(output_streams.begin(), output_streams.end(), [result](OutputStream* output_stream) { OutputStream::write_samples(output_stream, result["segment-duration"].as<double>()); });
+    std::vector<std::vector<float>> keyframeDTS;
+    std::transform(input_streams.begin(), input_streams.end(), std::back_inserter(keyframeDTS), [](InputStream *input) {return input->getKeyframesDTSTimeList();});
+
+    std::vector<float> alignedDTS = findAlignedDTS(keyframeDTS);
+    std::vector<float> filterdDTSByDuration = filterDTSBySegmentDuration(alignedDTS, result["segment-duration"].as<double>());
+    std::for_each(output_streams.begin(), output_streams.end(), [result, filterdDTSByDuration](OutputStream* output_stream) {
+        OutputStream::write_samples(output_stream, result["segment-duration"].as<double>(), filterdDTSByDuration);
+    });
 
     // clean up
     std::for_each(output_streams.begin(), output_streams.end(), [](OutputStream *ptr) {delete ptr;});
