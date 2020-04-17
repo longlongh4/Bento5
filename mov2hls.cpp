@@ -314,7 +314,7 @@ public:
         delete input_stream;
     };
 
-    static AP4_Result write_samples(std::vector<OutputStream *>output_streams, double seg_duration) {
+    static AP4_Result write_samples(OutputStream *output, double seg_duration) {
         AP4_Sample              audio_sample;
         AP4_DataBuffer          audio_sample_data;
         unsigned int            audio_sample_count = 0;
@@ -340,7 +340,6 @@ public:
         char                    string_buffer[4096];
         AP4_Result              result = AP4_SUCCESS;
 
-        const OutputStream *output = output_streams.at(0);
         const InputStream *input = output->input_stream;
 
         // prime the samples
@@ -572,7 +571,7 @@ int main(int argc, char** argv)
         output_streams.push_back(new OutputStream(file_path.append(out_folder.str()), input_streams.at(i)));
     }
 
-    OutputStream::write_samples(output_streams, result["segment-duration"].as<double>());
+    std::for_each(output_streams.begin(), output_streams.end(), [result](OutputStream* output_stream) { OutputStream::write_samples(output_stream, result["segment-duration"].as<double>()); });
 
     // clean up
     std::for_each(output_streams.begin(), output_streams.end(), [](OutputStream *ptr) {delete ptr;});
