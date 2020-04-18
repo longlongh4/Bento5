@@ -34,15 +34,15 @@ const char* INDEX_FILENAME = "stream.m3u8";
 
 const float MAX_DTS_DELTA = 0.2;
 
-static struct _Stats {
+class Stats {
+public:
     AP4_UI64 segments_total_size;
     double   segments_total_duration;
     AP4_UI32 segment_count;
     double   max_segment_bitrate;
-    AP4_UI64 iframes_total_size;
-    AP4_UI32 iframe_count;
-    double   max_iframe_bitrate;
-} Stats;
+    std::string codecs;
+    std::string resolution;
+};
 
 /*----------------------------------------------------------------------
 |   OpenOutput
@@ -243,6 +243,7 @@ private:
 class OutputStream {
 public:
     OutputStream(std::filesystem::path out_folder, const InputStream* input): ts_writer(NULL), audio_stream(NULL), video_stream(NULL), input_stream(input), out_folder(out_folder) {
+        AP4_SetMemory(&stats, 0, sizeof(Stats));
         if (bool flag = std::filesystem::create_directories(out_folder); flag == false) {
             fprintf(stderr, "failed to create output folder at %s, maybe it already exists?\n", std::filesystem::absolute(out_folder).string().c_str());
             exit(-1);
@@ -426,8 +427,8 @@ public:
 
                         if (segment_duration != 0.0) {
                             double segment_bitrate = 8.0*(double)segment_size/segment_duration;
-                            if (segment_bitrate > Stats.max_segment_bitrate) {
-                                Stats.max_segment_bitrate = segment_bitrate;
+                            if (segment_bitrate > output->stats.max_segment_bitrate) {
+                                output->stats.max_segment_bitrate = segment_bitrate;
                             }
                         }
                         segment_output->Release();
@@ -540,22 +541,72 @@ public:
         playlist->Release();
 
         // update stats
-        Stats.segment_count = segment_sizes.ItemCount();
+        output->stats.segment_count = segment_sizes.ItemCount();
         for (unsigned int i=0; i<segment_sizes.ItemCount(); i++) {
-            Stats.segments_total_size     += segment_sizes[i];
-            Stats.segments_total_duration += segment_durations[i];
+            output->stats.segments_total_size     += segment_sizes[i];
+            output->stats.segments_total_duration += segment_durations[i];
         }
+
+        // get codecs and resolution
+        std::vector<std::string> codecs;
+        if(input->audio_track) {
+            AP4_String codec;
+            AP4_SampleDescription *sdesc = input->audio_track->GetSampleDescription(0);
+            if (sdesc) {
+                sdesc ->GetCodecString(codec);
+                codecs.push_back(std::string(codec.GetChars()));
+            }
+        }
+        if(input->video_track) {
+            AP4_String codec;
+            AP4_SampleDescription *sdesc = input->video_track->GetSampleDescription(0);
+            if (sdesc) {
+                sdesc ->GetCodecString(codec);
+                codecs.push_back(std::string(codec.GetChars()));
+            }
+            std::ostringstream ss;
+            ss << input->video_track->GetWidth() << "x" << input->video_track->GetHeight();
+            output->stats.resolution = ss.str();
+        }
+        std::ostringstream ss_codecs;
+        std::copy(codecs.rbegin(),codecs.rend(), std::ostream_iterator<std::string>(ss_codecs,","));
+        output->stats.codecs = ss_codecs.str().substr(0, ss_codecs.str().size()-1);
 
         if (segment_output) segment_output->Release();
         return result;
     }
-private:
+    static AP4_Result generateMasterPlaylist(std::vector<OutputStream*> output_streams, std::filesystem::path output_dir) {
+        AP4_ByteStream* playlist = OpenOutput(output_dir, "master.m3u8", 0);
+        if (playlist == NULL) return AP4_ERROR_CANNOT_OPEN_FILE;
 
+
+        playlist->WriteString("#EXTM3U\r\n");
+        playlist->WriteString("# Created with Bento5 mov2hls\r\n\r\n");
+        playlist->WriteString("# Media Playlists\r\n");
+
+        std::for_each(output_streams.begin(), output_streams.end(), [playlist](OutputStream* os) {
+            char string_buffer[4096];
+            sprintf(string_buffer, "#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=%d,BANDWIDTH=%d,CODECS=\"%s\"", int(os->stats.segments_total_size/os->stats.segments_total_duration), int(os->stats.max_segment_bitrate), os->stats.codecs.c_str());
+            playlist->WriteString(string_buffer);
+            if (os->input_stream->video_track) {
+                sprintf(string_buffer, ",RESOLUTION=%s", os->stats.resolution.c_str());
+                playlist->WriteString(string_buffer);
+            }
+            playlist->WriteString("\r\n");
+            sprintf(string_buffer, "%s/stream.m3u8\r\n", os->out_folder.filename().string().c_str());
+            playlist->WriteString(string_buffer);
+        });
+        return AP4_SUCCESS;
+    }
+
+
+private:
     AP4_Mpeg2TsWriter*               ts_writer;
     AP4_Mpeg2TsWriter::SampleStream* audio_stream;
     AP4_Mpeg2TsWriter::SampleStream* video_stream;
     const InputStream *input_stream;
     std::filesystem::path out_folder;
+    Stats stats;
 };
 
 class VectorCommonFloatFinder {
@@ -638,8 +689,6 @@ int main(int argc, char** argv)
         exit(0);
     }
 
-    AP4_SetMemory(&Stats, 0, sizeof(Stats));
-
     std::vector<std::string> file_paths = result["input-files"].as<std::vector<std::string>>();
     std::vector<InputStream*> input_streams;
     std::transform(file_paths.begin(), file_paths.end(), std::back_inserter(input_streams), [](std::string s) {return new InputStream(s);});
@@ -660,6 +709,13 @@ int main(int argc, char** argv)
     std::for_each(output_streams.begin(), output_streams.end(), [result, filterdDTSByDuration](OutputStream* output_stream) {
         OutputStream::write_samples(output_stream, result["segment-duration"].as<double>(), filterdDTSByDuration);
     });
+
+    std::filesystem::path output_folder(result["output-dir"].as<std::string>());
+    AP4_Result res = OutputStream::generateMasterPlaylist(output_streams, output_folder.append("output"));
+    if (AP4_FAILED(res)) {
+        fprintf(stderr, "could not master playlist\n");
+        exit(-1);
+    }
 
     // clean up
     std::for_each(output_streams.begin(), output_streams.end(), [](OutputStream *ptr) {delete ptr;});
