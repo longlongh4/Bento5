@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <cxxopts.hpp>
 #include <filesystem>
+#include <cmath>
 #include "Ap4.h"
 #include "Ap4Mp4AudioInfo.h"
 
@@ -36,6 +37,7 @@ const float MAX_DTS_DELTA = 0.2;
 
 class Stats {
 public:
+    Stats(): segments_total_size(0), segments_total_duration(0.0), segment_count(0), max_segment_bitrate(0.0), codecs(""), resolution("")  {}
     AP4_UI64 segments_total_size;
     double   segments_total_duration;
     AP4_UI32 segment_count;
@@ -424,7 +426,7 @@ public:
                         segment_positions.Append(segment_position);
                         segment_durations.Append(segment_duration);
 
-                        if (segment_duration != 0.0) {
+                        if (abs(segment_duration) > 0.0) {
                             double segment_bitrate = 8.0*(double)segment_size/segment_duration;
                             if (segment_bitrate > output->stats.max_segment_bitrate) {
                                 output->stats.max_segment_bitrate = segment_bitrate;
@@ -541,9 +543,9 @@ public:
 
         // update stats
         output->stats.segment_count = segment_sizes.ItemCount();
+        output->stats.segments_total_duration = total_duration;
         for (unsigned int i=0; i<segment_sizes.ItemCount(); i++) {
-            output->stats.segments_total_size     += segment_sizes[i];
-            output->stats.segments_total_duration += segment_durations[i];
+            output->stats.segments_total_size  += segment_sizes[i];
         }
 
         // get codecs and resolution
@@ -586,7 +588,7 @@ public:
 
         std::for_each(output_streams.begin(), output_streams.end(), [playlist](OutputStream* os) {
             char string_buffer[4096];
-            sprintf(string_buffer, "#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=%d,BANDWIDTH=%d,CODECS=\"%s\"", int(os->stats.segments_total_size/os->stats.segments_total_duration), int(os->stats.max_segment_bitrate), os->stats.codecs.c_str());
+            sprintf(string_buffer, "#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=%d,BANDWIDTH=%d,CODECS=\"%s\"", int(ceil(8.0 * os->stats.segments_total_size/os->stats.segments_total_duration)), int(ceil(os->stats.max_segment_bitrate)), os->stats.codecs.c_str());
             playlist->WriteString(string_buffer);
             if (os->input_stream->video_track) {
                 sprintf(string_buffer, ",RESOLUTION=%s", os->stats.resolution.c_str());
