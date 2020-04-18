@@ -38,3 +38,13 @@ The segment layout of the HLS v3 streams looks like:
 ![](./imgs/segment_layout_bento5.png)
 
 All segments are aligned and we also choose the best position near `--segment-duration` to split the files.
+
+## How to compile
+
+```
+git clone https://github.com/longlongh4/Bento5.git
+cd Bento5
+git submodule update --init --recursive
+cmake .
+make
+```
