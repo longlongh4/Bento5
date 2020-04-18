@@ -243,7 +243,6 @@ private:
 class OutputStream {
 public:
     OutputStream(std::filesystem::path out_folder, const InputStream* input): ts_writer(NULL), audio_stream(NULL), video_stream(NULL), input_stream(input), out_folder(out_folder) {
-        AP4_SetMemory(&stats, 0, sizeof(Stats));
         if (bool flag = std::filesystem::create_directories(out_folder); flag == false) {
             fprintf(stderr, "failed to create output folder at %s, maybe it already exists?\n", std::filesystem::absolute(out_folder).string().c_str());
             exit(-1);
@@ -564,9 +563,10 @@ public:
                 sdesc ->GetCodecString(codec);
                 codecs.push_back(std::string(codec.GetChars()));
             }
-            std::ostringstream ss;
-            ss << input->video_track->GetWidth() << "x" << input->video_track->GetHeight();
-            output->stats.resolution = ss.str();
+            char buffer[1024];
+            AP4_VideoSampleDescription* vsd = AP4_DYNAMIC_CAST(AP4_VideoSampleDescription, input->video_track->GetSampleDescription(0));
+            sprintf(buffer, "%dx%d", vsd->GetWidth(), vsd->GetHeight());
+            output->stats.resolution = std::string(buffer);
         }
         std::ostringstream ss_codecs;
         std::copy(codecs.rbegin(),codecs.rend(), std::ostream_iterator<std::string>(ss_codecs,","));
