@@ -26,3 +26,15 @@ The segment layout of the HLS v3 streams looks like:
 ![](./imgs/segment_layout_bento4.png)
 
 Each rectangle represents a TS segment. We can see that at some positions, the segments are not aligned. Media-3 even has lesser segments than the other two streams.
+
+When we use Bento5 to generate HLS 3 stream with following code:
+
+```
+mov2hls -o . -i ads/240.mp4,ads/360.mp4,ads/480.mp4 --segment-duration 6
+```
+
+The segment layout of the HLS v3 streams looks like:
+
+![](./imgs/segment_layout_bento5.png)
+
+All segments are aligned and we also choose the best position near `--segment-duration` to split the files.
